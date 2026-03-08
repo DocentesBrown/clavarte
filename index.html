@@ -1,17 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Slider } from "@/components/ui/slider";
-import { Progress } from "@/components/ui/progress";
-import { Download, ImagePlus, Play, RotateCcw, Camera, ChevronsRight, ChevronsLeft } from "lucide-react";
 
 const CANVAS_SIZE = 700;
 const DEFAULT_NAILS = 200;
 const DEFAULT_DIAMETER_CM = 50;
+const DEFAULT_ITERATIONS = 900;
 const THREAD_ALPHA = 0.11;
-const MAX_LINE_CACHE_DISTANCE = 120;
+const MIN_CIRCULAR_GAP = 8;
+const MIN_LINE_DISTANCE = 120;
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
@@ -44,6 +39,7 @@ function bresenhamLine(x0, y0, x1, y1) {
       y0 += sy;
     }
   }
+
   return points;
 }
 
@@ -51,35 +47,36 @@ function createCircularNails(count, size, radiusFactor = 0.485) {
   const center = size / 2;
   const radius = center * radiusFactor;
   return Array.from({ length: count }, (_, i) => {
-    const angle = (-Math.PI / 2) + (i / count) * Math.PI * 2;
+    const angle = -Math.PI / 2 + (i / count) * Math.PI * 2;
     return {
       id: i,
-      angle,
       x: Math.round(center + radius * Math.cos(angle)),
       y: Math.round(center + radius * Math.sin(angle)),
+      angle,
     };
   });
 }
 
-function loadImage(file) {
+function loadImageFromFile(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
       const img = new Image();
       img.onload = () => resolve(img);
-      img.onerror = reject;
-      img.src = reader.result;
+      img.onerror = () => reject(new Error("No se pudo leer la imagen."));
+      img.src = String(reader.result || "");
     };
-    reader.onerror = reject;
+    reader.onerror = () => reject(new Error("No se pudo abrir el archivo."));
     reader.readAsDataURL(file);
   });
 }
 
-function imageToTargetMatrix(img, size = CANVAS_SIZE, contrast = 1.2, invert = false) {
+function imageToTargetMatrix(img, size, contrast) {
   const canvas = document.createElement("canvas");
   canvas.width = size;
   canvas.height = size;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("Tu navegador no soporta canvas 2D.");
 
   ctx.fillStyle = "white";
   ctx.fillRect(0, 0, size, size);
@@ -89,11 +86,9 @@ function imageToTargetMatrix(img, size = CANVAS_SIZE, contrast = 1.2, invert = f
   const sy = (img.height - minSide) / 2;
   ctx.drawImage(img, sx, sy, minSide, minSide, 0, 0, size, size);
 
-  const imageData = ctx.getImageData(0, 0, size, size);
-  const data = imageData.data;
+  const { data } = ctx.getImageData(0, 0, size, size);
   const center = size / 2;
   const radius = center * 0.485;
-
   const matrix = new Float32Array(size * size);
 
   for (let y = 0; y < size; y++) {
@@ -102,30 +97,25 @@ function imageToTargetMatrix(img, size = CANVAS_SIZE, contrast = 1.2, invert = f
       const r = data[idx];
       const g = data[idx + 1];
       const b = data[idx + 2];
-      const grayBase = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-      let gray = grayBase;
+      let gray = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
       gray = (gray - 0.5) * contrast + 0.5;
       gray = clamp(gray, 0, 1);
-      const dist = Math.sqrt((x - center) ** 2 + (y - center) ** 2);
-      const inside = dist <= radius;
+
+      const inside = Math.sqrt((x - center) ** 2 + (y - center) ** 2) <= radius;
       const darkness = inside ? 1 - gray : 0;
-      matrix[y * size + x] = invert ? 1 - darkness : darkness;
+      matrix[y * size + x] = darkness;
     }
   }
 
-  return { matrix, size, radius, center };
+  return { matrix, size };
 }
 
-function buildLineCache(nails, size) {
+function buildLineCache(nails) {
   const cache = new Map();
   for (let i = 0; i < nails.length; i++) {
     for (let j = i + 1; j < nails.length; j++) {
-      const a = nails[i];
-      const b = nails[j];
-      const chord = distance(a, b);
-      if (chord < MAX_LINE_CACHE_DISTANCE) continue;
-      const key = `${i}-${j}`;
-      cache.set(key, bresenhamLine(a.x, a.y, b.x, b.y));
+      if (distance(nails[i], nails[j]) < MIN_LINE_DISTANCE) continue;
+      cache.set(`${i}-${j}`, bresenhamLine(nails[i].x, nails[i].y, nails[j].x, nails[j].y));
     }
   }
   return cache;
@@ -134,9 +124,7 @@ function buildLineCache(nails, size) {
 function getLinePoints(cache, nails, a, b) {
   const key = a < b ? `${a}-${b}` : `${b}-${a}`;
   if (cache.has(key)) return cache.get(key);
-  const p1 = nails[a];
-  const p2 = nails[b];
-  return bresenhamLine(p1.x, p1.y, p2.x, p2.y);
+  return bresenhamLine(nails[a].x, nails[a].y, nails[b].x, nails[b].y);
 }
 
 function scoreLine(points, residual, size) {
@@ -145,10 +133,10 @@ function scoreLine(points, residual, size) {
     const [x, y] = points[i];
     score += residual[y * size + x];
   }
-  return score / points.length;
+  return score / Math.max(points.length, 1);
 }
 
-function applyLine(points, residual, size, alpha = THREAD_ALPHA) {
+function applyLine(points, residual, size, alpha) {
   for (let i = 0; i < points.length; i++) {
     const [x, y] = points[i];
     const idx = y * size + x;
@@ -156,9 +144,9 @@ function applyLine(points, residual, size, alpha = THREAD_ALPHA) {
   }
 }
 
-function computeStringArt(target, nails, iterations, onProgress) {
+async function computeStringArtAsync(target, nails, iterations, onProgress) {
   const residual = new Float32Array(target.matrix);
-  const cache = buildLineCache(nails, target.size);
+  const cache = buildLineCache(nails);
   const path = [0];
   const usedPairs = new Set();
   let current = 0;
@@ -172,40 +160,41 @@ function computeStringArt(target, nails, iterations, onProgress) {
       if (candidate === current) continue;
       const gap = Math.abs(candidate - current);
       const circularGap = Math.min(gap, nails.length - gap);
-      if (circularGap < 8) continue;
+      if (circularGap < MIN_CIRCULAR_GAP) continue;
 
       const pairKey = current < candidate ? `${current}-${candidate}` : `${candidate}-${current}`;
       if (usedPairs.has(pairKey)) continue;
 
       const points = getLinePoints(cache, nails, current, candidate);
-      const lineScore = scoreLine(points, residual, target.size);
-
-      if (lineScore > bestScore) {
-        bestScore = lineScore;
+      const currentScore = scoreLine(points, residual, target.size);
+      if (currentScore > bestScore) {
+        bestScore = currentScore;
         bestNext = candidate;
         bestPoints = points;
       }
     }
 
-    if (bestNext == null || bestScore < 0.005) break;
+    if (bestNext == null || !bestPoints || bestScore < 0.005) break;
 
     applyLine(bestPoints, residual, target.size, THREAD_ALPHA);
-    const pairKey = current < bestNext ? `${current}-${bestNext}` : `${bestNext}-${current}`;
-    usedPairs.add(pairKey);
+    usedPairs.add(current < bestNext ? `${current}-${bestNext}` : `${bestNext}-${current}`);
     path.push(bestNext);
     current = bestNext;
 
-    if (step % 5 === 0 && onProgress) {
+    if (step % 5 === 0) {
       onProgress(Math.round((step / iterations) * 100));
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
 
-  if (onProgress) onProgress(100);
-  return { path, residual };
+  onProgress(100);
+  return { path };
 }
 
 function drawTargetPreview(canvas, target) {
   const ctx = canvas.getContext("2d");
+  if (!ctx || !target) return;
+
   const imageData = ctx.createImageData(target.size, target.size);
   for (let i = 0; i < target.matrix.length; i++) {
     const v = 255 - Math.round(target.matrix[i] * 255);
@@ -217,15 +206,18 @@ function drawTargetPreview(canvas, target) {
   ctx.putImageData(imageData, 0, 0);
 }
 
-function drawStringPreview(canvas, nails, path, highlightStep = null) {
+function drawStringPreview(canvas, nails, path, highlightStep) {
   const ctx = canvas.getContext("2d");
-  const { width, height } = canvas;
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#fffaf3";
-  ctx.fillRect(0, 0, width, height);
+  if (!ctx) return;
 
+  const width = canvas.width;
   const center = width / 2;
   const radius = center * 0.485;
+
+  ctx.clearRect(0, 0, width, width);
+  ctx.fillStyle = "#fffaf3";
+  ctx.fillRect(0, 0, width, width);
+
   ctx.strokeStyle = "#d4c3a3";
   ctx.lineWidth = 4;
   ctx.beginPath();
@@ -239,6 +231,7 @@ function drawStringPreview(canvas, nails, path, highlightStep = null) {
   for (let i = 1; i < path.length; i++) {
     const from = nails[path[i - 1]];
     const to = nails[path[i]];
+    if (!from || !to) continue;
     ctx.beginPath();
     ctx.moveTo(from.x, from.y);
     ctx.lineTo(to.x, to.y);
@@ -246,42 +239,44 @@ function drawStringPreview(canvas, nails, path, highlightStep = null) {
   }
   ctx.restore();
 
-  nails.forEach((nail) => {
+  for (const nail of nails) {
     ctx.fillStyle = "#6b7280";
     ctx.beginPath();
     ctx.arc(nail.x, nail.y, 3.2, 0, Math.PI * 2);
     ctx.fill();
-  });
+  }
 
-  if (highlightStep != null && highlightStep > 0 && highlightStep < path.length) {
+  if (highlightStep > 0 && highlightStep < path.length) {
     const from = nails[path[highlightStep - 1]];
     const to = nails[path[highlightStep]];
-    ctx.strokeStyle = "#7c3aed";
-    ctx.lineWidth = 3.5;
-    ctx.beginPath();
-    ctx.moveTo(from.x, from.y);
-    ctx.lineTo(to.x, to.y);
-    ctx.stroke();
-
-    [from, to].forEach((p) => {
-      ctx.fillStyle = "#dc2626";
+    if (from && to) {
+      ctx.strokeStyle = "#7c3aed";
+      ctx.lineWidth = 3.5;
       ctx.beginPath();
-      ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
-      ctx.fill();
-    });
+      ctx.moveTo(from.x, from.y);
+      ctx.lineTo(to.x, to.y);
+      ctx.stroke();
+
+      [from, to].forEach((p) => {
+        ctx.fillStyle = "#da6863";
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
   }
 }
 
 function downloadInstructions(path, nailsCount, diameterCm) {
-  const lines = [];
   const circumference = Math.PI * diameterCm;
   const spacing = circumference / nailsCount;
-
-  lines.push(`Bastidor circular: ${diameterCm} cm de diámetro`);
-  lines.push(`Cantidad de clavos: ${nailsCount}`);
-  lines.push(`Separación aproximada entre clavos: ${spacing.toFixed(2)} cm`);
-  lines.push("");
-  lines.push("Secuencia de hilo:");
+  const lines = [
+    `Bastidor circular: ${diameterCm} cm de diámetro`,
+    `Cantidad de clavos: ${nailsCount}`,
+    `Separación aproximada entre clavos: ${spacing.toFixed(2)} cm`,
+    "",
+    "Secuencia de hilo:",
+  ];
 
   for (let i = 1; i < path.length; i++) {
     lines.push(`Paso ${i}: clavo ${path[i - 1] + 1} → clavo ${path[i] + 1}`);
@@ -296,25 +291,55 @@ function downloadInstructions(path, nailsCount, diameterCm) {
   URL.revokeObjectURL(url);
 }
 
+function runSelfTests() {
+  const tests = [];
+
+  const nails = createCircularNails(12, 120);
+  tests.push({
+    name: "createCircularNails genera la cantidad correcta",
+    ok: nails.length === 12,
+  });
+
+  const line = bresenhamLine(0, 0, 3, 0);
+  tests.push({
+    name: "bresenhamLine incluye origen y destino",
+    ok: line.length === 4 && line[0][0] === 0 && line[3][0] === 3,
+  });
+
+  tests.push({
+    name: "clamp respeta mínimo y máximo",
+    ok: clamp(-1, 0, 10) === 0 && clamp(99, 0, 10) === 10 && clamp(5, 0, 10) === 5,
+  });
+
+  return tests;
+}
+
 export default function StringArtTerapiaApp() {
   const [nailsCount, setNailsCount] = useState(DEFAULT_NAILS);
   const [diameterCm, setDiameterCm] = useState(DEFAULT_DIAMETER_CM);
-  const [iterations, setIterations] = useState(1200);
+  const [iterations, setIterations] = useState(DEFAULT_ITERATIONS);
   const [contrast, setContrast] = useState(1.25);
   const [fileName, setFileName] = useState("");
   const [target, setTarget] = useState(null);
   const [path, setPath] = useState([]);
-  const [progress, setProgress] = useState(0);
+  const [stepIndex, setStepIndex] = useState(0);
   const [working, setWorking] = useState(false);
-  const [stepIndex, setStepIndex] = useState(1);
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState("");
+  const [tests] = useState(runSelfTests());
+
   const targetCanvasRef = useRef(null);
   const resultCanvasRef = useRef(null);
 
   const nails = useMemo(() => createCircularNails(nailsCount, CANVAS_SIZE), [nailsCount]);
+  const spacingCm = ((Math.PI * diameterCm) / nailsCount).toFixed(2);
+  const testsOk = tests.every((t) => t.ok);
 
   useEffect(() => {
-    if (target && targetCanvasRef.current) {
-      drawTargetPreview(targetCanvasRef.current, target);
+    if (targetCanvasRef.current) {
+      const ctx = targetCanvasRef.current.getContext("2d");
+      ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+      if (target) drawTargetPreview(targetCanvasRef.current, target);
     }
   }, [target]);
 
@@ -324,236 +349,258 @@ export default function StringArtTerapiaApp() {
     }
   }, [nails, path, stepIndex]);
 
-  async function handleFile(file) {
+  async function handleFileChange(file) {
     if (!file) return;
-    setFileName(file.name || "captura");
-    const img = await loadImage(file);
-    const converted = imageToTargetMatrix(img, CANVAS_SIZE, contrast, false);
-    setTarget(converted);
-    setPath([]);
-    setStepIndex(1);
+    try {
+      setError("");
+      setFileName(file.name || "captura");
+      const img = await loadImageFromFile(file);
+      const nextTarget = imageToTargetMatrix(img, CANVAS_SIZE, contrast);
+      setTarget(nextTarget);
+      setPath([]);
+      setStepIndex(0);
+      setProgress(0);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo cargar la imagen.");
+    }
+  }
+
+  async function regenerateTargetFromCurrentFile(file) {
+    if (!file) return;
+    try {
+      const img = await loadImageFromFile(file);
+      const nextTarget = imageToTargetMatrix(img, CANVAS_SIZE, contrast);
+      setTarget(nextTarget);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo actualizar la imagen.");
+    }
   }
 
   async function runAlgorithm() {
-    if (!target) return;
-    setWorking(true);
-    setProgress(2);
-    setPath([]);
-    setStepIndex(1);
+    if (!target) {
+      setError("Primero cargá una imagen.");
+      return;
+    }
 
-    setTimeout(() => {
-      try {
-        const result = computeStringArt(target, nails, iterations, setProgress);
-        setPath(result.path);
-        setStepIndex(Math.min(1, result.path.length - 1));
-      } finally {
-        setWorking(false);
-      }
-    }, 50);
+    try {
+      setError("");
+      setWorking(true);
+      setProgress(0);
+      setPath([]);
+      setStepIndex(0);
+      const result = await computeStringArtAsync(target, nails, iterations, setProgress);
+      setPath(result.path);
+      setStepIndex(result.path.length > 1 ? 1 : 0);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Falló la generación de la guía.");
+    } finally {
+      setWorking(false);
+    }
   }
 
   function resetAll() {
+    setError("");
+    setFileName("");
     setTarget(null);
     setPath([]);
-    setFileName("");
+    setStepIndex(0);
     setProgress(0);
-    setStepIndex(1);
-    if (targetCanvasRef.current) {
-      const ctx = targetCanvasRef.current.getContext("2d");
-      ctx.clearRect(0, 0, targetCanvasRef.current.width, targetCanvasRef.current.height);
-    }
-    if (resultCanvasRef.current) {
-      const ctx = resultCanvasRef.current.getContext("2d");
-      ctx.clearRect(0, 0, resultCanvasRef.current.width, resultCanvasRef.current.height);
-    }
+    setWorking(false);
   }
 
-  const currentInstruction = path.length > 1 && stepIndex > 0 && stepIndex < path.length
-    ? `Paso ${stepIndex}: llevar el hilo del clavo ${path[stepIndex - 1] + 1} al clavo ${path[stepIndex] + 1}`
-    : "Todavía no generaste una secuencia.";
-
-  const spacingCm = ((Math.PI * diameterCm) / nailsCount).toFixed(2);
+  const instruction =
+    path.length > 1 && stepIndex > 0 && stepIndex < path.length
+      ? `Paso ${stepIndex}: llevar el hilo del clavo ${path[stepIndex - 1] + 1} al clavo ${path[stepIndex] + 1}`
+      : "Todavía no generaste una secuencia.";
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-amber-50 via-orange-50 to-violet-50 p-4 md:p-8">
-      <div className="mx-auto max-w-7xl space-y-6">
-        <div className="rounded-3xl bg-white/80 p-6 shadow-xl backdrop-blur">
-          <h1 className="text-3xl font-bold tracking-tight text-slate-900 md:text-4xl">String Art Terapéutico</h1>
-          <p className="mt-2 max-w-3xl text-sm text-slate-600 md:text-base">
-            Subí una foto o capturala desde el celular. La app la transforma en una guía de hilos para un bastidor circular con clavos.
-            Después seguís los pasos uno por uno: de qué clavo salir y a cuál ir.
+    <div className="min-h-screen bg-[linear-gradient(135deg,#f8f4ea,#f3efdc)] p-3 md:p-6 text-slate-800">
+      <div className="mx-auto max-w-7xl space-y-4">
+        <section className="rounded-[24px] border border-white/70 bg-white/85 p-5 shadow-[0_14px_40px_rgba(36,73,110,0.12)] backdrop-blur">
+          <h1 className="text-3xl font-bold tracking-tight md:text-5xl">String Art Terapéutico</h1>
+          <p className="mt-3 max-w-4xl text-sm leading-6 text-slate-600 md:text-base">
+            Subí una foto o capturala desde el celular. La app la procesa y la transforma en una guía de hilos para un bastidor circular con clavos.
+            Después seguís los pasos uno por uno: de qué clavo salís y a cuál vas.
           </p>
-          <div className="mt-4 grid gap-3 md:grid-cols-4">
-            <div className="rounded-2xl border bg-slate-50 p-4">
-              <div className="text-xs uppercase tracking-wide text-slate-500">Bastidor</div>
-              <div className="mt-1 text-lg font-semibold text-slate-900">{diameterCm} cm</div>
-            </div>
-            <div className="rounded-2xl border bg-slate-50 p-4">
-              <div className="text-xs uppercase tracking-wide text-slate-500">Clavos</div>
-              <div className="mt-1 text-lg font-semibold text-slate-900">{nailsCount}</div>
-            </div>
-            <div className="rounded-2xl border bg-slate-50 p-4">
-              <div className="text-xs uppercase tracking-wide text-slate-500">Separación aprox.</div>
-              <div className="mt-1 text-lg font-semibold text-slate-900">{spacingCm} cm</div>
-            </div>
-            <div className="rounded-2xl border bg-slate-50 p-4">
-              <div className="text-xs uppercase tracking-wide text-slate-500">Pasos generados</div>
-              <div className="mt-1 text-lg font-semibold text-slate-900">{Math.max(0, path.length - 1)}</div>
-            </div>
-          </div>
-        </div>
 
-        <div className="grid gap-6 xl:grid-cols-[380px_1fr]">
-          <Card className="rounded-3xl border-0 shadow-xl">
-            <CardHeader>
-              <CardTitle className="text-xl">Configuración</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-6">
-              <div className="space-y-2">
-                <Label htmlFor="file">Subir foto</Label>
-                <Input
-                  id="file"
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <StatCard label="Bastidor" value={`${diameterCm} cm`} />
+            <StatCard label="Clavos" value={String(nailsCount)} />
+            <StatCard label="Separación aprox." value={`${spacingCm} cm`} />
+            <StatCard label="Pasos generados" value={String(Math.max(0, path.length - 1))} />
+          </div>
+        </section>
+
+        <div className="grid gap-4 xl:grid-cols-[370px_1fr]">
+          <section className="rounded-[24px] border border-white/70 bg-white/85 p-5 shadow-[0_14px_40px_rgba(36,73,110,0.12)] backdrop-blur">
+            <h2 className="text-2xl font-bold">Configuración</h2>
+
+            <div className="mt-4 space-y-5">
+              <Field label="Subir foto">
+                <input
                   type="file"
                   accept="image/*"
-                  onChange={(e) => handleFile(e.target.files?.[0])}
+                  className="w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm"
+                  onChange={(e) => handleFileChange(e.target.files?.[0] || null)}
                 />
-              </div>
+              </Field>
 
-              <div className="space-y-2">
-                <Label htmlFor="camera">Capturar desde el celular</Label>
-                <Input
-                  id="camera"
+              <Field label="Capturar desde el celular">
+                <input
                   type="file"
                   accept="image/*"
                   capture="environment"
-                  onChange={(e) => handleFile(e.target.files?.[0])}
+                  className="w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm"
+                  onChange={(e) => handleFileChange(e.target.files?.[0] || null)}
                 />
-                <p className="text-xs text-slate-500">En la mayoría de los navegadores móviles esto abre la cámara trasera.</p>
-              </div>
+                <p className="mt-2 text-xs text-slate-500">En la mayoría de los navegadores móviles esto abre la cámara trasera.</p>
+              </Field>
 
-              <div className="space-y-3">
-                <div className="flex items-center justify-between text-sm">
-                  <Label>Cantidad de clavos</Label>
-                  <span className="font-medium">{nailsCount}</span>
-                </div>
-                <Slider value={[nailsCount]} min={80} max={280} step={10} onValueChange={(v) => setNailsCount(v[0])} />
-              </div>
+              <RangeControl label="Cantidad de clavos" value={nailsCount} min={80} max={280} step={10} suffix="" onChange={setNailsCount} />
+              <RangeControl label="Diámetro del bastidor" value={diameterCm} min={20} max={80} step={1} suffix=" cm" onChange={setDiameterCm} />
+              <RangeControl label="Nivel de detalle" value={iterations} min={200} max={2400} step={100} suffix=" líneas" onChange={setIterations} />
+              <RangeControl label="Contraste de la imagen" value={contrast} min={0.8} max={2} step={0.05} suffix="" formatter={(n) => n.toFixed(2)} onChange={setContrast} />
 
-              <div className="space-y-3">
-                <div className="flex items-center justify-between text-sm">
-                  <Label>Diámetro del bastidor</Label>
-                  <span className="font-medium">{diameterCm} cm</span>
-                </div>
-                <Slider value={[diameterCm]} min={20} max={80} step={1} onValueChange={(v) => setDiameterCm(v[0])} />
-              </div>
-
-              <div className="space-y-3">
-                <div className="flex items-center justify-between text-sm">
-                  <Label>Nivel de detalle</Label>
-                  <span className="font-medium">{iterations} líneas</span>
-                </div>
-                <Slider value={[iterations]} min={200} max={2400} step={100} onValueChange={(v) => setIterations(v[0])} />
-              </div>
-
-              <div className="space-y-3">
-                <div className="flex items-center justify-between text-sm">
-                  <Label>Contraste de la imagen</Label>
-                  <span className="font-medium">{contrast.toFixed(2)}</span>
-                </div>
-                <Slider value={[contrast]} min={0.8} max={2} step={0.05} onValueChange={(v) => setContrast(v[0])} />
-              </div>
-
-              <div className="flex flex-wrap gap-3">
-                <Button className="rounded-2xl" onClick={runAlgorithm} disabled={!target || working}>
-                  <Play className="mr-2 h-4 w-4" /> Generar guía
-                </Button>
-                <Button className="rounded-2xl" variant="secondary" onClick={resetAll}>
-                  <RotateCcw className="mr-2 h-4 w-4" /> Reiniciar
-                </Button>
-                <Button className="rounded-2xl" variant="outline" onClick={() => downloadInstructions(path, nailsCount, diameterCm)} disabled={path.length < 2}>
-                  <Download className="mr-2 h-4 w-4" /> Descargar pasos
-                </Button>
+              <div className="flex flex-wrap gap-2">
+                <ActionButton onClick={runAlgorithm} disabled={working}>Generar guía</ActionButton>
+                <ActionButton secondary onClick={resetAll} disabled={working}>Reiniciar</ActionButton>
+                <ActionButton outline onClick={() => downloadInstructions(path, nailsCount, diameterCm)} disabled={path.length < 2 || working}>Descargar pasos</ActionButton>
               </div>
 
               {working && (
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between text-sm text-slate-600">
+                <div>
+                  <div className="mb-2 flex items-center justify-between text-sm text-slate-600">
                     <span>Procesando imagen…</span>
                     <span>{progress}%</span>
                   </div>
-                  <Progress value={progress} />
+                  <div className="h-3 w-full overflow-hidden rounded-full bg-slate-200">
+                    <div className="h-full rounded-full bg-[linear-gradient(90deg,#5b3a82,#24496e)] transition-all" style={{ width: `${progress}%` }} />
+                  </div>
                 </div>
               )}
 
-              <div className="rounded-2xl bg-violet-50 p-4 text-sm text-slate-700">
-                <div className="font-semibold text-violet-900">Consejo práctico</div>
-                <p className="mt-1">
-                  Con un bastidor de 50 cm, 200 clavos dejan una separación aproximada de {spacingCm} cm entre clavos.
+              <div className="rounded-2xl bg-violet-50 p-4 text-sm leading-6 text-violet-950">
+                <strong>Consejo práctico</strong>
+                <div>
+                  Con un bastidor de {diameterCm} cm, {nailsCount} clavos dejan una separación aproximada de {spacingCm} cm entre clavos.
                   Es un buen punto de partida para retratos simples o siluetas.
-                </p>
+                </div>
               </div>
-            </CardContent>
-          </Card>
 
-          <div className="grid gap-6 lg:grid-cols-2">
-            <Card className="rounded-3xl border-0 shadow-xl">
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-xl">
-                  <ImagePlus className="h-5 w-5" /> Referencia procesada
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <canvas ref={targetCanvasRef} width={CANVAS_SIZE} height={CANVAS_SIZE} className="aspect-square w-full rounded-2xl border bg-white" />
-                <div className="mt-3 text-sm text-slate-500">
-                  {fileName ? `Imagen cargada: ${fileName}` : "Todavía no cargaste una imagen."}
+              {error && <div className="rounded-2xl bg-red-50 p-4 text-sm text-red-700">{error}</div>}
+            </div>
+          </section>
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <section className="rounded-[24px] border border-white/70 bg-white/85 p-5 shadow-[0_14px_40px_rgba(36,73,110,0.12)] backdrop-blur">
+              <h2 className="text-2xl font-bold">Referencia procesada</h2>
+              <canvas ref={targetCanvasRef} width={CANVAS_SIZE} height={CANVAS_SIZE} className="mt-4 aspect-square w-full rounded-[20px] border border-slate-200 bg-white" />
+              <p className="mt-3 text-sm text-slate-500">{fileName ? `Imagen cargada: ${fileName}` : "Todavía no cargaste una imagen."}</p>
+            </section>
+
+            <section className="rounded-[24px] border border-white/70 bg-white/85 p-5 shadow-[0_14px_40px_rgba(36,73,110,0.12)] backdrop-blur">
+              <h2 className="text-2xl font-bold">Vista del bastidor</h2>
+              <canvas ref={resultCanvasRef} width={CANVAS_SIZE} height={CANVAS_SIZE} className="mt-4 aspect-square w-full rounded-[20px] border border-slate-200 bg-white" />
+
+              <div className="mt-4 rounded-2xl bg-slate-50 p-4">
+                <div className="text-[11px] uppercase tracking-[0.08em] text-slate-500">Instrucción actual</div>
+                <div className="mt-2 text-lg font-extrabold leading-7">{instruction}</div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <ActionButton secondary disabled={path.length < 2 || stepIndex <= 1} onClick={() => setStepIndex((s) => Math.max(1, s - 1))}>Anterior</ActionButton>
+                  <ActionButton disabled={path.length < 2 || stepIndex >= path.length - 1} onClick={() => setStepIndex((s) => Math.min(path.length - 1, s + 1))}>Siguiente</ActionButton>
                 </div>
-              </CardContent>
-            </Card>
+              </div>
+            </section>
 
-            <Card className="rounded-3xl border-0 shadow-xl">
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-xl">
-                  <Camera className="h-5 w-5" /> Vista del bastidor
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <canvas ref={resultCanvasRef} width={CANVAS_SIZE} height={CANVAS_SIZE} className="aspect-square w-full rounded-2xl border bg-white" />
-                <div className="mt-4 rounded-2xl bg-slate-50 p-4">
-                  <div className="text-xs uppercase tracking-wide text-slate-500">Instrucción actual</div>
-                  <div className="mt-2 text-lg font-semibold text-slate-900">{currentInstruction}</div>
-                  <div className="mt-4 flex flex-wrap items-center gap-3">
-                    <Button variant="secondary" className="rounded-2xl" onClick={() => setStepIndex((s) => Math.max(1, s - 1))} disabled={path.length < 2 || stepIndex <= 1}>
-                      <ChevronsLeft className="mr-2 h-4 w-4" /> Anterior
-                    </Button>
-                    <Button className="rounded-2xl" onClick={() => setStepIndex((s) => Math.min(path.length - 1, s + 1))} disabled={path.length < 2 || stepIndex >= path.length - 1}>
-                      Siguiente <ChevronsRight className="ml-2 h-4 w-4" />
-                    </Button>
+            <section className="rounded-[24px] border border-white/70 bg-white/85 p-5 shadow-[0_14px_40px_rgba(36,73,110,0.12)] backdrop-blur lg:col-span-2">
+              <h2 className="text-2xl font-bold">Chequeos internos</h2>
+              <div className={`mt-3 inline-flex rounded-full px-3 py-1 text-sm font-semibold ${testsOk ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>
+                {testsOk ? "OK" : "Hay pruebas fallando"}
+              </div>
+              <div className="mt-4 grid gap-3 md:grid-cols-3">
+                {tests.map((test) => (
+                  <div key={test.name} className={`rounded-2xl border p-4 text-sm ${test.ok ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-red-200 bg-red-50 text-red-800"}`}>
+                    <div className="font-semibold">{test.ok ? "✔" : "✘"} {test.name}</div>
                   </div>
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card className="rounded-3xl border-0 shadow-xl lg:col-span-2">
-              <CardHeader>
-                <CardTitle className="text-xl">Primeros pasos sugeridos</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="grid gap-4 md:grid-cols-3">
-                  {[
-                    "Usar fotos con fondo limpio y alto contraste.",
-                    "Probar entre 180 y 220 clavos para un bastidor de 50 cm.",
-                    "Empezar por rostros frontales, manos o siluetas simples."
-                  ].map((item) => (
-                    <div key={item} className="rounded-2xl border bg-slate-50 p-4 text-sm text-slate-700">
-                      {item}
-                    </div>
-                  ))}
-                </div>
-              </CardContent>
-            </Card>
+                ))}
+              </div>
+            </section>
           </div>
         </div>
       </div>
+
+      <ContrastWatcher contrast={contrast} fileName={fileName} regenerate={regenerateTargetFromCurrentFile} />
     </div>
   );
+}
+
+function ContrastWatcher({ contrast, fileName, regenerate }) {
+  const prevContrast = useRef(contrast);
+  const lastFileRef = useRef(null);
+
+  useEffect(() => {
+    const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+    const currentFile = inputs.map((input) => input.files?.[0]).find(Boolean) || null;
+    lastFileRef.current = currentFile;
+  });
+
+  useEffect(() => {
+    if (prevContrast.current !== contrast && fileName && lastFileRef.current) {
+      regenerate(lastFileRef.current);
+    }
+    prevContrast.current = contrast;
+  }, [contrast, fileName, regenerate]);
+
+  return null;
+}
+
+function StatCard({ label, value }) {
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+      <div className="text-[11px] uppercase tracking-[0.08em] text-slate-500">{label}</div>
+      <div className="mt-1 text-2xl font-bold">{value}</div>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div>
+      <label className="mb-2 block text-sm font-semibold">{label}</label>
+      {children}
+    </div>
+  );
+}
+
+function RangeControl({ label, value, min, max, step, suffix, onChange, formatter }) {
+  const showValue = formatter ? formatter(value) : String(value);
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between gap-3 text-sm">
+        <label className="font-semibold">{label}</label>
+        <strong>{showValue}{suffix}</strong>
+      </div>
+      <input
+        type="range"
+        className="w-full accent-violet-700"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+    </div>
+  );
+}
+
+function ActionButton({ children, secondary, outline, ...props }) {
+  let className = "rounded-2xl px-4 py-3 font-bold transition disabled:cursor-not-allowed disabled:opacity-55";
+  if (secondary) {
+    className += " bg-slate-100 text-slate-800";
+  } else if (outline) {
+    className += " border border-slate-300 bg-white text-slate-800";
+  } else {
+    className += " bg-violet-800 text-white shadow-[0_8px_18px_rgba(91,58,130,0.18)]";
+  }
+  return <button className={className} {...props}>{children}</button>;
 }
