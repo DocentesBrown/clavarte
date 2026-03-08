@@ -1,0 +1,559 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Slider } from "@/components/ui/slider";
+import { Progress } from "@/components/ui/progress";
+import { Download, ImagePlus, Play, RotateCcw, Camera, ChevronsRight, ChevronsLeft } from "lucide-react";
+
+const CANVAS_SIZE = 700;
+const DEFAULT_NAILS = 200;
+const DEFAULT_DIAMETER_CM = 50;
+const THREAD_ALPHA = 0.11;
+const MAX_LINE_CACHE_DISTANCE = 120;
+
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+function distance(a, b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function bresenhamLine(x0, y0, x1, y1) {
+  const points = [];
+  let dx = Math.abs(x1 - x0);
+  let dy = Math.abs(y1 - y0);
+  let sx = x0 < x1 ? 1 : -1;
+  let sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+
+  while (true) {
+    points.push([x0, y0]);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) {
+      err -= dy;
+      x0 += sx;
+    }
+    if (e2 < dx) {
+      err += dx;
+      y0 += sy;
+    }
+  }
+  return points;
+}
+
+function createCircularNails(count, size, radiusFactor = 0.485) {
+  const center = size / 2;
+  const radius = center * radiusFactor;
+  return Array.from({ length: count }, (_, i) => {
+    const angle = (-Math.PI / 2) + (i / count) * Math.PI * 2;
+    return {
+      id: i,
+      angle,
+      x: Math.round(center + radius * Math.cos(angle)),
+      y: Math.round(center + radius * Math.sin(angle)),
+    };
+  });
+}
+
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function imageToTargetMatrix(img, size = CANVAS_SIZE, contrast = 1.2, invert = false) {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+  ctx.fillStyle = "white";
+  ctx.fillRect(0, 0, size, size);
+
+  const minSide = Math.min(img.width, img.height);
+  const sx = (img.width - minSide) / 2;
+  const sy = (img.height - minSide) / 2;
+  ctx.drawImage(img, sx, sy, minSide, minSide, 0, 0, size, size);
+
+  const imageData = ctx.getImageData(0, 0, size, size);
+  const data = imageData.data;
+  const center = size / 2;
+  const radius = center * 0.485;
+
+  const matrix = new Float32Array(size * size);
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const idx = (y * size + x) * 4;
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+      const grayBase = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      let gray = grayBase;
+      gray = (gray - 0.5) * contrast + 0.5;
+      gray = clamp(gray, 0, 1);
+      const dist = Math.sqrt((x - center) ** 2 + (y - center) ** 2);
+      const inside = dist <= radius;
+      const darkness = inside ? 1 - gray : 0;
+      matrix[y * size + x] = invert ? 1 - darkness : darkness;
+    }
+  }
+
+  return { matrix, size, radius, center };
+}
+
+function buildLineCache(nails, size) {
+  const cache = new Map();
+  for (let i = 0; i < nails.length; i++) {
+    for (let j = i + 1; j < nails.length; j++) {
+      const a = nails[i];
+      const b = nails[j];
+      const chord = distance(a, b);
+      if (chord < MAX_LINE_CACHE_DISTANCE) continue;
+      const key = `${i}-${j}`;
+      cache.set(key, bresenhamLine(a.x, a.y, b.x, b.y));
+    }
+  }
+  return cache;
+}
+
+function getLinePoints(cache, nails, a, b) {
+  const key = a < b ? `${a}-${b}` : `${b}-${a}`;
+  if (cache.has(key)) return cache.get(key);
+  const p1 = nails[a];
+  const p2 = nails[b];
+  return bresenhamLine(p1.x, p1.y, p2.x, p2.y);
+}
+
+function scoreLine(points, residual, size) {
+  let score = 0;
+  for (let i = 0; i < points.length; i++) {
+    const [x, y] = points[i];
+    score += residual[y * size + x];
+  }
+  return score / points.length;
+}
+
+function applyLine(points, residual, size, alpha = THREAD_ALPHA) {
+  for (let i = 0; i < points.length; i++) {
+    const [x, y] = points[i];
+    const idx = y * size + x;
+    residual[idx] = Math.max(0, residual[idx] - alpha);
+  }
+}
+
+function computeStringArt(target, nails, iterations, onProgress) {
+  const residual = new Float32Array(target.matrix);
+  const cache = buildLineCache(nails, target.size);
+  const path = [0];
+  const usedPairs = new Set();
+  let current = 0;
+
+  for (let step = 0; step < iterations; step++) {
+    let bestNext = null;
+    let bestScore = -Infinity;
+    let bestPoints = null;
+
+    for (let candidate = 0; candidate < nails.length; candidate++) {
+      if (candidate === current) continue;
+      const gap = Math.abs(candidate - current);
+      const circularGap = Math.min(gap, nails.length - gap);
+      if (circularGap < 8) continue;
+
+      const pairKey = current < candidate ? `${current}-${candidate}` : `${candidate}-${current}`;
+      if (usedPairs.has(pairKey)) continue;
+
+      const points = getLinePoints(cache, nails, current, candidate);
+      const lineScore = scoreLine(points, residual, target.size);
+
+      if (lineScore > bestScore) {
+        bestScore = lineScore;
+        bestNext = candidate;
+        bestPoints = points;
+      }
+    }
+
+    if (bestNext == null || bestScore < 0.005) break;
+
+    applyLine(bestPoints, residual, target.size, THREAD_ALPHA);
+    const pairKey = current < bestNext ? `${current}-${bestNext}` : `${bestNext}-${current}`;
+    usedPairs.add(pairKey);
+    path.push(bestNext);
+    current = bestNext;
+
+    if (step % 5 === 0 && onProgress) {
+      onProgress(Math.round((step / iterations) * 100));
+    }
+  }
+
+  if (onProgress) onProgress(100);
+  return { path, residual };
+}
+
+function drawTargetPreview(canvas, target) {
+  const ctx = canvas.getContext("2d");
+  const imageData = ctx.createImageData(target.size, target.size);
+  for (let i = 0; i < target.matrix.length; i++) {
+    const v = 255 - Math.round(target.matrix[i] * 255);
+    imageData.data[i * 4] = v;
+    imageData.data[i * 4 + 1] = v;
+    imageData.data[i * 4 + 2] = v;
+    imageData.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(imageData, 0, 0);
+}
+
+function drawStringPreview(canvas, nails, path, highlightStep = null) {
+  const ctx = canvas.getContext("2d");
+  const { width, height } = canvas;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#fffaf3";
+  ctx.fillRect(0, 0, width, height);
+
+  const center = width / 2;
+  const radius = center * 0.485;
+  ctx.strokeStyle = "#d4c3a3";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.arc(center, center, radius, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.save();
+  ctx.globalAlpha = 0.15;
+  ctx.strokeStyle = "#111827";
+  ctx.lineWidth = 1;
+  for (let i = 1; i < path.length; i++) {
+    const from = nails[path[i - 1]];
+    const to = nails[path[i]];
+    ctx.beginPath();
+    ctx.moveTo(from.x, from.y);
+    ctx.lineTo(to.x, to.y);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  nails.forEach((nail) => {
+    ctx.fillStyle = "#6b7280";
+    ctx.beginPath();
+    ctx.arc(nail.x, nail.y, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  if (highlightStep != null && highlightStep > 0 && highlightStep < path.length) {
+    const from = nails[path[highlightStep - 1]];
+    const to = nails[path[highlightStep]];
+    ctx.strokeStyle = "#7c3aed";
+    ctx.lineWidth = 3.5;
+    ctx.beginPath();
+    ctx.moveTo(from.x, from.y);
+    ctx.lineTo(to.x, to.y);
+    ctx.stroke();
+
+    [from, to].forEach((p) => {
+      ctx.fillStyle = "#dc2626";
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+}
+
+function downloadInstructions(path, nailsCount, diameterCm) {
+  const lines = [];
+  const circumference = Math.PI * diameterCm;
+  const spacing = circumference / nailsCount;
+
+  lines.push(`Bastidor circular: ${diameterCm} cm de diámetro`);
+  lines.push(`Cantidad de clavos: ${nailsCount}`);
+  lines.push(`Separación aproximada entre clavos: ${spacing.toFixed(2)} cm`);
+  lines.push("");
+  lines.push("Secuencia de hilo:");
+
+  for (let i = 1; i < path.length; i++) {
+    lines.push(`Paso ${i}: clavo ${path[i - 1] + 1} → clavo ${path[i] + 1}`);
+  }
+
+  const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "instrucciones-string-art.txt";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export default function StringArtTerapiaApp() {
+  const [nailsCount, setNailsCount] = useState(DEFAULT_NAILS);
+  const [diameterCm, setDiameterCm] = useState(DEFAULT_DIAMETER_CM);
+  const [iterations, setIterations] = useState(1200);
+  const [contrast, setContrast] = useState(1.25);
+  const [fileName, setFileName] = useState("");
+  const [target, setTarget] = useState(null);
+  const [path, setPath] = useState([]);
+  const [progress, setProgress] = useState(0);
+  const [working, setWorking] = useState(false);
+  const [stepIndex, setStepIndex] = useState(1);
+  const targetCanvasRef = useRef(null);
+  const resultCanvasRef = useRef(null);
+
+  const nails = useMemo(() => createCircularNails(nailsCount, CANVAS_SIZE), [nailsCount]);
+
+  useEffect(() => {
+    if (target && targetCanvasRef.current) {
+      drawTargetPreview(targetCanvasRef.current, target);
+    }
+  }, [target]);
+
+  useEffect(() => {
+    if (resultCanvasRef.current) {
+      drawStringPreview(resultCanvasRef.current, nails, path, stepIndex);
+    }
+  }, [nails, path, stepIndex]);
+
+  async function handleFile(file) {
+    if (!file) return;
+    setFileName(file.name || "captura");
+    const img = await loadImage(file);
+    const converted = imageToTargetMatrix(img, CANVAS_SIZE, contrast, false);
+    setTarget(converted);
+    setPath([]);
+    setStepIndex(1);
+  }
+
+  async function runAlgorithm() {
+    if (!target) return;
+    setWorking(true);
+    setProgress(2);
+    setPath([]);
+    setStepIndex(1);
+
+    setTimeout(() => {
+      try {
+        const result = computeStringArt(target, nails, iterations, setProgress);
+        setPath(result.path);
+        setStepIndex(Math.min(1, result.path.length - 1));
+      } finally {
+        setWorking(false);
+      }
+    }, 50);
+  }
+
+  function resetAll() {
+    setTarget(null);
+    setPath([]);
+    setFileName("");
+    setProgress(0);
+    setStepIndex(1);
+    if (targetCanvasRef.current) {
+      const ctx = targetCanvasRef.current.getContext("2d");
+      ctx.clearRect(0, 0, targetCanvasRef.current.width, targetCanvasRef.current.height);
+    }
+    if (resultCanvasRef.current) {
+      const ctx = resultCanvasRef.current.getContext("2d");
+      ctx.clearRect(0, 0, resultCanvasRef.current.width, resultCanvasRef.current.height);
+    }
+  }
+
+  const currentInstruction = path.length > 1 && stepIndex > 0 && stepIndex < path.length
+    ? `Paso ${stepIndex}: llevar el hilo del clavo ${path[stepIndex - 1] + 1} al clavo ${path[stepIndex] + 1}`
+    : "Todavía no generaste una secuencia.";
+
+  const spacingCm = ((Math.PI * diameterCm) / nailsCount).toFixed(2);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-amber-50 via-orange-50 to-violet-50 p-4 md:p-8">
+      <div className="mx-auto max-w-7xl space-y-6">
+        <div className="rounded-3xl bg-white/80 p-6 shadow-xl backdrop-blur">
+          <h1 className="text-3xl font-bold tracking-tight text-slate-900 md:text-4xl">String Art Terapéutico</h1>
+          <p className="mt-2 max-w-3xl text-sm text-slate-600 md:text-base">
+            Subí una foto o capturala desde el celular. La app la transforma en una guía de hilos para un bastidor circular con clavos.
+            Después seguís los pasos uno por uno: de qué clavo salir y a cuál ir.
+          </p>
+          <div className="mt-4 grid gap-3 md:grid-cols-4">
+            <div className="rounded-2xl border bg-slate-50 p-4">
+              <div className="text-xs uppercase tracking-wide text-slate-500">Bastidor</div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">{diameterCm} cm</div>
+            </div>
+            <div className="rounded-2xl border bg-slate-50 p-4">
+              <div className="text-xs uppercase tracking-wide text-slate-500">Clavos</div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">{nailsCount}</div>
+            </div>
+            <div className="rounded-2xl border bg-slate-50 p-4">
+              <div className="text-xs uppercase tracking-wide text-slate-500">Separación aprox.</div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">{spacingCm} cm</div>
+            </div>
+            <div className="rounded-2xl border bg-slate-50 p-4">
+              <div className="text-xs uppercase tracking-wide text-slate-500">Pasos generados</div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">{Math.max(0, path.length - 1)}</div>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid gap-6 xl:grid-cols-[380px_1fr]">
+          <Card className="rounded-3xl border-0 shadow-xl">
+            <CardHeader>
+              <CardTitle className="text-xl">Configuración</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="space-y-2">
+                <Label htmlFor="file">Subir foto</Label>
+                <Input
+                  id="file"
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => handleFile(e.target.files?.[0])}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="camera">Capturar desde el celular</Label>
+                <Input
+                  id="camera"
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  onChange={(e) => handleFile(e.target.files?.[0])}
+                />
+                <p className="text-xs text-slate-500">En la mayoría de los navegadores móviles esto abre la cámara trasera.</p>
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between text-sm">
+                  <Label>Cantidad de clavos</Label>
+                  <span className="font-medium">{nailsCount}</span>
+                </div>
+                <Slider value={[nailsCount]} min={80} max={280} step={10} onValueChange={(v) => setNailsCount(v[0])} />
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between text-sm">
+                  <Label>Diámetro del bastidor</Label>
+                  <span className="font-medium">{diameterCm} cm</span>
+                </div>
+                <Slider value={[diameterCm]} min={20} max={80} step={1} onValueChange={(v) => setDiameterCm(v[0])} />
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between text-sm">
+                  <Label>Nivel de detalle</Label>
+                  <span className="font-medium">{iterations} líneas</span>
+                </div>
+                <Slider value={[iterations]} min={200} max={2400} step={100} onValueChange={(v) => setIterations(v[0])} />
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between text-sm">
+                  <Label>Contraste de la imagen</Label>
+                  <span className="font-medium">{contrast.toFixed(2)}</span>
+                </div>
+                <Slider value={[contrast]} min={0.8} max={2} step={0.05} onValueChange={(v) => setContrast(v[0])} />
+              </div>
+
+              <div className="flex flex-wrap gap-3">
+                <Button className="rounded-2xl" onClick={runAlgorithm} disabled={!target || working}>
+                  <Play className="mr-2 h-4 w-4" /> Generar guía
+                </Button>
+                <Button className="rounded-2xl" variant="secondary" onClick={resetAll}>
+                  <RotateCcw className="mr-2 h-4 w-4" /> Reiniciar
+                </Button>
+                <Button className="rounded-2xl" variant="outline" onClick={() => downloadInstructions(path, nailsCount, diameterCm)} disabled={path.length < 2}>
+                  <Download className="mr-2 h-4 w-4" /> Descargar pasos
+                </Button>
+              </div>
+
+              {working && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-sm text-slate-600">
+                    <span>Procesando imagen…</span>
+                    <span>{progress}%</span>
+                  </div>
+                  <Progress value={progress} />
+                </div>
+              )}
+
+              <div className="rounded-2xl bg-violet-50 p-4 text-sm text-slate-700">
+                <div className="font-semibold text-violet-900">Consejo práctico</div>
+                <p className="mt-1">
+                  Con un bastidor de 50 cm, 200 clavos dejan una separación aproximada de {spacingCm} cm entre clavos.
+                  Es un buen punto de partida para retratos simples o siluetas.
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+
+          <div className="grid gap-6 lg:grid-cols-2">
+            <Card className="rounded-3xl border-0 shadow-xl">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-xl">
+                  <ImagePlus className="h-5 w-5" /> Referencia procesada
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <canvas ref={targetCanvasRef} width={CANVAS_SIZE} height={CANVAS_SIZE} className="aspect-square w-full rounded-2xl border bg-white" />
+                <div className="mt-3 text-sm text-slate-500">
+                  {fileName ? `Imagen cargada: ${fileName}` : "Todavía no cargaste una imagen."}
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card className="rounded-3xl border-0 shadow-xl">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-xl">
+                  <Camera className="h-5 w-5" /> Vista del bastidor
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <canvas ref={resultCanvasRef} width={CANVAS_SIZE} height={CANVAS_SIZE} className="aspect-square w-full rounded-2xl border bg-white" />
+                <div className="mt-4 rounded-2xl bg-slate-50 p-4">
+                  <div className="text-xs uppercase tracking-wide text-slate-500">Instrucción actual</div>
+                  <div className="mt-2 text-lg font-semibold text-slate-900">{currentInstruction}</div>
+                  <div className="mt-4 flex flex-wrap items-center gap-3">
+                    <Button variant="secondary" className="rounded-2xl" onClick={() => setStepIndex((s) => Math.max(1, s - 1))} disabled={path.length < 2 || stepIndex <= 1}>
+                      <ChevronsLeft className="mr-2 h-4 w-4" /> Anterior
+                    </Button>
+                    <Button className="rounded-2xl" onClick={() => setStepIndex((s) => Math.min(path.length - 1, s + 1))} disabled={path.length < 2 || stepIndex >= path.length - 1}>
+                      Siguiente <ChevronsRight className="ml-2 h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card className="rounded-3xl border-0 shadow-xl lg:col-span-2">
+              <CardHeader>
+                <CardTitle className="text-xl">Primeros pasos sugeridos</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="grid gap-4 md:grid-cols-3">
+                  {[
+                    "Usar fotos con fondo limpio y alto contraste.",
+                    "Probar entre 180 y 220 clavos para un bastidor de 50 cm.",
+                    "Empezar por rostros frontales, manos o siluetas simples."
+                  ].map((item) => (
+                    <div key={item} className="rounded-2xl border bg-slate-50 p-4 text-sm text-slate-700">
+                      {item}
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
